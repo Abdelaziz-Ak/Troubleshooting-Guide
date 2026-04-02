@@ -105,3 +105,28 @@ Connecting EKS to AWS Secrets Manager or RDS is the #1 point of failure in cloud
         type: Recreate
       ```
       This forces K8s to completely kill the old pod (and unmount the volume) *before* it even tries to spin up the new one.
+
+---
+
+## 7. Phase 6: The "What If" Edge Cases (Project-Specific Risks)
+
+Even if you didn't experience these explicitly in this run, your specific architecture (ArgoCD, ECR, ALB, Redis) makes you highly susceptible to these common failures:
+
+### "What If" 1: Pod is Running `0/1 Ready` (Not CrashLoopBackOff)
+*   **Cause (Liveness/Readiness Probes):** The container started successfully so it doesn't crash, but the application is taking too long to boot (e.g., Django running migrations or Redis loading snapshot to memory). The `ReadinessProbe` checks `/api/health/` and receives a timeout. Kubernetes refuses to send traffic to the pod until the probe returns HTTP `200`.
+*   **Methodical Troubleshooting:** Check `kubectl describe po`. Look at the bottom under Events for `Readiness probe failed: HTTP probe failed with statuscode: 500`. Increase the `initialDelaySeconds` in your deployment YAML so Kubernetes waits longer before checking if the app is ready.
+
+### "What If" 2: `ErrImagePull` or `ImagePullBackOff`
+*   **Cause (ECR Permissions):** If you are using AWS ECR for your Docker images, the EKS Node Group (AWS EC2 instances) must have the `AmazonEC2ContainerRegistryReadOnly` IAM policy attached. If you forgot this in your Terraform `eks infra` code, the nodes cannot authenticate to ECR to pull the image.
+*   **Methodical Troubleshooting:** Run `kubectl describe po`. If the Events show `pull access denied` or `no basic auth credentials`, it's an IAM issue on the Node Group, NOT a Kubernetes issue.
+
+### "What If" 3: ArgoCD says `OutOfSync` but the cluster functions perfectly
+*   **Cause (Configuration Drift):** Someone bypassed GitOps and ran a manual `kubectl edit deployment backend` or `kubectl scale` command directly in the terminal to quickly fix a production issue. ArgoCD detected that the live cluster state no longer matches the source of truth in the GitHub repository (`k8s-manifests`).
+*   **Fix:** Use the ArgoCD UI "App Diff" to find what was manually changed. Update the GitHub repository to reflect the needed change, or click "Sync" in ArgoCD to overwrite the manual terminal change and enforce the Git repo's true state.
+
+### "What If" 4: ALB Ingress Controller refuses to create an ALB
+*   **Cause (Subnet Tagging):** You deployed your `ingress.yaml` but `kubectl get ing` shows `<none>` under Address for 15+ minutes. The AWS ALB Controller requires your AWS VPC Subnets to be specifically tagged so it knows *where* it is mathematically allowed to place the physical ALB. 
+*   **Fix:** Ensure your Terraform VPC module tagged your public subnets with `kubernetes.io/role/elb = 1` and private with `kubernetes.io/role/internal-elb = 1`. Always check the controller logs if Ingress hangs: 
+  ```bash
+  kubectl logs -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
+  ```
